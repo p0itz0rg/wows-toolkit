@@ -2,7 +2,6 @@ use std::{
     collections::HashSet,
     fs::{self, File},
     path::{Path, PathBuf},
-    rc::Rc,
     sync::{
         atomic::{AtomicBool, Ordering},
         mpsc, Arc,
@@ -61,6 +60,8 @@ impl ToolkitTabViewer<'_> {
 
                             self.tab_state.file_viewer.lock().push(viewer);
                         }
+
+                        ui.close_menu();
                     }
                 }
             })

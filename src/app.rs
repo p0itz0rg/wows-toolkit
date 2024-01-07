@@ -1,10 +1,7 @@
 use std::{
     collections::HashMap,
     error::Error,
-    fs::{read_dir, File},
-    io::Cursor,
     path::{Path, PathBuf},
-    rc::Rc,
     sync::{
         atomic::Ordering,
         mpsc::{self, TryRecvError},
@@ -12,11 +9,14 @@ use std::{
     },
 };
 
-use egui::{mutex::Mutex, OpenUrl, Ui, WidgetText};
+use egui::{
+    mutex::{Mutex, RwLock},
+    OpenUrl, Ui, WidgetText,
+};
 use egui_dock::{DockArea, DockState, Style, TabViewer};
 use egui_extras::{Size, StripBuilder};
 use gettext::Catalog;
-use language_tags::LanguageTag;
+
 use notify::{
     event::{ModifyKind, RenameMode},
     EventKind, RecommendedWatcher, RecursiveMode, Watcher,
@@ -25,19 +25,16 @@ use octocrab::models::repos::Release;
 
 use serde::{Deserialize, Serialize};
 use sys_locale::get_locale;
-use wows_replays::{analyzer::battle_controller::GameMessage, game_params::Species};
-use wowsunpack::{
-    idx::{self, FileNode},
-    pkg::PkgFileLoader,
-};
+use wows_replays::{analyzer::battle_controller::GameMessage, game_params::Species, ReplayFile};
+use wowsunpack::{idx::FileNode, pkg::PkgFileLoader};
 
 use crate::{
-    error::DataLoadError,
+    error::ToolkitError,
     file_unpacker::{UnpackerProgress, UNPACKER_STOP},
     game_params::GameMetadataProvider,
     plaintext_viewer::PlaintextFileViewer,
     replay_parser::{Replay, SharedReplayParserTabState},
-    task::{self, BackgroundTaskCompletion, ShipIcon},
+    task::{self, BackgroundTask, BackgroundTaskCompletion, BackgroundTaskKind, ShipIcon},
 };
 
 #[derive(Clone)]
@@ -132,11 +129,19 @@ pub struct WorldOfWarshipsData {
 
     pub game_metadata: Option<Arc<GameMetadataProvider>>,
 
-    pub current_replay: Option<Replay>,
+    pub current_replay: Option<Arc<RwLock<Replay>>>,
 
     pub ship_icons: Option<HashMap<Species, ShipIcon>>,
 
     pub game_version: Option<usize>,
+}
+
+impl WorldOfWarshipsData {
+    /// Indicates whether or not enough game data has been loaded to interact
+    /// with the PKG filesystem or replays
+    pub fn is_ready(&self) -> bool {
+        self.file_tree.is_some() && self.pkg_loader.is_some()
+    }
 }
 
 #[derive(Serialize, Deserialize)]
@@ -222,10 +227,10 @@ pub struct TabState {
     pub file_receiver: Option<mpsc::Receiver<NotifyFileEvent>>,
 
     #[serde(skip)]
-    pub replay_files: Option<Vec<PathBuf>>,
+    pub replay_files: Option<HashMap<PathBuf, Arc<RwLock<Replay>>>>,
 
     #[serde(skip)]
-    pub background_task_channel: Option<mpsc::Receiver<Result<BackgroundTaskCompletion, DataLoadError>>>,
+    pub background_task: Option<BackgroundTask>,
 
     #[serde(skip)]
     pub can_change_wows_dir: bool,
@@ -256,7 +261,7 @@ impl Default for TabState {
             replays_dir: None,
             replay_files: None,
             file_receiver: None,
-            background_task_channel: None,
+            background_task: None,
             can_change_wows_dir: false,
         }
     }
@@ -269,12 +274,14 @@ impl TabState {
                 while let Ok(file_event) = file.try_recv() {
                     match file_event {
                         NotifyFileEvent::Added(new_file) => {
-                            replay_files.insert(0, new_file);
+                            let replay_file: ReplayFile = ReplayFile::from_file(&new_file).unwrap();
+                            let game_metadata = self.world_of_warships_data.game_metadata.clone().unwrap();
+                            let replay = Replay::new(replay_file, game_metadata);
+                            let replay = Arc::new(RwLock::new(replay));
+                            replay_files.insert(new_file, replay);
                         }
                         NotifyFileEvent::Removed(old_file) => {
-                            if let Some(pos) = replay_files.iter().position(|file_path| file_path == &old_file) {
-                                replay_files.remove(pos);
-                            }
+                            replay_files.remove(&old_file);
                         }
                     }
                 }
@@ -346,7 +353,10 @@ impl TabState {
             let _ = tx.send(task::load_wows_files(wows_directory, locale.as_str()));
         });
 
-        self.background_task_channel = Some(rx);
+        self.background_task = Some(BackgroundTask {
+            receiver: rx,
+            kind: BackgroundTaskKind::LoadingData,
+        });
     }
 }
 
@@ -413,34 +423,29 @@ impl WowsToolkitApp {
     pub fn build_bottom_panel(&mut self, ui: &mut Ui) {
         ui.horizontal(|ui| {
             // TODO: Merge these channels
-            if let Some(rx) = &self.tab_state.background_task_channel {
-                match rx.try_recv() {
-                    Ok(result) => {
-                        match result {
-                            Ok(data) => match data {
-                                BackgroundTaskCompletion::DataLoaded { new_dir, wows_data, replays } => {
-                                    self.tab_state.update_wows_dir(&new_dir);
-                                    self.tab_state.world_of_warships_data = wows_data;
-                                    self.tab_state.replay_files = replays;
-                                }
-                            },
-                            Err(e) => {
-                                self.show_error_window = true;
-                                self.error_to_show = Some(Box::new(e));
+            if let Some(task) = &self.tab_state.background_task {
+                if let Some(result) = task.build_description(ui) {
+                    match result {
+                        Ok(data) => match data {
+                            BackgroundTaskCompletion::DataLoaded { new_dir, wows_data, replays } => {
+                                self.tab_state.update_wows_dir(&new_dir);
+                                self.tab_state.world_of_warships_data = wows_data;
+                                self.tab_state.replay_files = replays;
                             }
+                            BackgroundTaskCompletion::ReplayLoaded { replay } => {
+                                {
+                                    self.tab_state.replay_parser_tab.lock().game_chat.clear();
+                                }
+                                self.tab_state.world_of_warships_data.current_replay = Some(replay);
+                            }
+                        },
+                        Err(ToolkitError::BackgroundTaskCompleted) => {
+                            self.tab_state.background_task = None;
                         }
-
-                        // Regardless of whether it's success or failure, we now need to allow
-                        // the user to change the WoWs directory.
-                        self.tab_state.allow_changing_wows_dir();
-                        self.tab_state.background_task_channel = None;
-                    }
-                    Err(TryRecvError::Empty) => {
-                        ui.label("Loading game data...");
-                        ui.spinner();
-                    }
-                    Err(TryRecvError::Disconnected) => {
-                        self.tab_state.background_task_channel = None;
+                        Err(e) => {
+                            self.show_error_window = true;
+                            self.error_to_show = Some(Box::new(e));
+                        }
                     }
                 }
             } else if let Some(rx) = &self.tab_state.unpacker_progress {

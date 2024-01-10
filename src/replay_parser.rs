@@ -4,14 +4,13 @@ use std::{
     sync::{atomic::AtomicBool, mpsc, Arc},
 };
 
+use crate::icons;
 use egui::{
     mutex::{Mutex, RwLock},
     text::LayoutJob,
     Color32, Image, ImageSource, Label, OpenUrl, RichText, Sense, TextFormat, Vec2,
 };
 use egui_extras::{Column, TableBuilder};
-
-use notify::Watcher;
 
 use tap::Pipe;
 
@@ -117,6 +116,7 @@ impl ToolkitTabViewer<'_> {
             .column(Column::initial(100.0).clip(true))
             .column(Column::initial(100.0).clip(true))
             .column(Column::initial(100.0).clip(true))
+            .column(Column::initial(50.0).clip(true))
             .column(Column::remainder())
             .min_scrolled_height(0.0);
 
@@ -148,6 +148,9 @@ impl ToolkitTabViewer<'_> {
                 });
                 header.col(|ui| {
                     ui.strong("Allocated Skills");
+                });
+                header.col(|ui| {
+                    ui.strong("Modules");
                 });
                 header.col(|ui| {
                     ui.strong("Actions");
@@ -197,8 +200,15 @@ impl ToolkitTabViewer<'_> {
                             }
 
                             let is_dark_mode = ui.visuals().dark_mode;
-                            let name_color = player_color_for_team_relation(player.relation(), is_dark_mode);
+                            let name_color = if player.is_abuser() {
+                                Color32::from_rgb(0xFF, 0xC0, 0xCB) // pink
+                            } else {
+                                player_color_for_team_relation(player.relation(), is_dark_mode)
+                            };
                             ui.label(RichText::new(player_name_with_clan(player)).color(name_color));
+                            if player.is_hidden() {
+                                ui.label(icons::EYE_SLASH).on_hover_text("Player has a hidden profile");
+                            }
                         });
 
                         if self.tab_state.settings.replay_settings.show_entity_id {
@@ -240,20 +250,37 @@ impl ToolkitTabViewer<'_> {
                         });
 
                         let species = ship.species().expect("ship has no species?");
-                        let (skill_points, num_skills) = entity
+                        let (skill_points, num_skills, highest_tier, num_tier_1_skills) = entity
                             .commander_skills()
                             .map(|skills| {
                                 let points = skills.iter().fold(0usize, |accum, skill| accum + skill.tier().get_for_species(species.clone()));
+                                let highest_tier = skills.iter().map(|skill| skill.tier().get_for_species(species.clone())).max();
+                                let num_tier_1_skills = skills.iter().fold(0, |mut accum, skill| {
+                                    if skill.tier().get_for_species(species.clone()) == 1 {
+                                        accum += 1;
+                                    }
+                                    accum
+                                });
 
-                                (points, skills.len())
+                                (points, skills.len(), highest_tier.unwrap_or(0), num_tier_1_skills)
                             })
-                            .unwrap_or((0, 0));
+                            .unwrap_or((0, 0, 0, 0));
                         ui.col(|ui| {
-                            ui.label(format!("{}pts ({} skills)", skill_points, num_skills));
+                            let (label, hover_text) = util::colorize_captain_points(skill_points, num_skills, highest_tier, num_tier_1_skills);
+                            ui.label(label).pipe(|label| {
+                                if let Some(hover_text) = hover_text {
+                                    label.on_hover_text(hover_text)
+                                } else {
+                                    label
+                                }
+                            });
                         });
                         ui.col(|ui| {
-                            ui.menu_button("Actions", |ui| {
-                                if ui.small_button("Open Build in Browser").clicked() {
+                            ui.label(entity.props().ship_config().modernization().len().to_string());
+                        });
+                        ui.col(|ui| {
+                            ui.menu_button(icons::DOTS_THREE, |ui| {
+                                if ui.small_button(format!("{} Open Build in Browser", icons::SHARE)).clicked() {
                                     let metadata_provider = self.tab_state.world_of_warships_data.game_metadata.as_ref().unwrap();
 
                                     let url = build_ship_config_url(entity, metadata_provider);
@@ -262,7 +289,7 @@ impl ToolkitTabViewer<'_> {
                                     ui.close_menu();
                                 }
 
-                                if ui.small_button("Copy Build Link").clicked() {
+                                if ui.small_button(format!("{} Copy Build Link", icons::COPY)).clicked() {
                                     let metadata_provider = self.tab_state.world_of_warships_data.game_metadata.as_ref().unwrap();
 
                                     let url = build_ship_config_url(entity, metadata_provider);
@@ -271,7 +298,7 @@ impl ToolkitTabViewer<'_> {
                                     ui.close_menu();
                                 }
 
-                                if ui.small_button("Copy Short Build Link").clicked() {
+                                if ui.small_button(format!("{} Copy Short Build Link", icons::COPY)).clicked() {
                                     let metadata_provider = self.tab_state.world_of_warships_data.game_metadata.as_ref().unwrap();
 
                                     let url = build_short_ship_config_url(entity, metadata_provider);
@@ -280,7 +307,7 @@ impl ToolkitTabViewer<'_> {
                                     ui.close_menu();
                                 }
 
-                                if ui.small_button("Open WoWs Numbers Page").clicked() {
+                                if ui.small_button(format!("{} Open WoWs Numbers Page", icons::SHARE)).clicked() {
                                     if let Some(url) = build_wows_numbers_url(entity) {
                                         ui.ctx().open_url(OpenUrl::new_tab(url));
                                     }
@@ -363,8 +390,8 @@ impl ToolkitTabViewer<'_> {
             let self_entity = report.self_entity();
             let self_player = self_entity.player().unwrap();
             ui.horizontal(|ui| {
-                ui.heading(player_name_with_clan(self_player));
-                ui.label(report.match_group());
+                ui.label(player_name_with_clan(self_player));
+                ui.label(report.game_type());
                 ui.label(report.version().to_path());
                 ui.label(report.game_mode());
                 ui.label(report.map_name());
@@ -424,16 +451,22 @@ impl ToolkitTabViewer<'_> {
                             let map_id = format!("IDS_{}", meta.mapName.to_uppercase());
                             let map_name = resource_provider.localized_name_from_id(&map_id).unwrap_or_else(|| meta.mapName.clone());
 
-                            let mode = meta.gameType.as_str();
-                            let match_type = meta.matchGroup.as_str();
+                            let mode = resource_provider
+                                .localized_name_from_id(&format!("IDS_{}", meta.gameType.to_ascii_uppercase()))
+                                .expect("failed to get game type translation");
+
+                            let scenario = resource_provider
+                                .localized_name_from_id(&format!("IDS_SCENARIO_{}", meta.scenario.to_ascii_uppercase()))
+                                .expect("failed to get scenario translation");
 
                             let time = meta.dateTime.as_str();
 
-                            [vehicle_name.as_str(), map_name.as_str(), match_type, mode, time].iter().join(" - ")
+                            [vehicle_name.as_str(), map_name.as_str(), scenario.as_str(), mode.as_str(), time].iter().join(" - ")
                         };
 
                         if ui
-                            .add(Label::new(label).sense(Sense::click()))
+                            .add(Label::new(label.as_str()).sense(Sense::click()))
+                            .on_hover_text(label.as_str())
                             .context_menu(|ui| {
                                 if ui.button("Copy Path").clicked() {
                                     ui.output_mut(|output| output.copied_text = path.to_string_lossy().into_owned());
@@ -522,7 +555,7 @@ impl ToolkitTabViewer<'_> {
                     self.parse_replay(self.tab_state.settings.current_replay_path.clone());
                 }
 
-                if ui.button("Browse...").clicked() {
+                if ui.button(format!("{} Browse...", icons::FOLDER_OPEN)).clicked() {
                     if let Some(file) = rfd::FileDialog::new().add_filter("WoWs Replays", &["wowsreplay"]).pick_file() {
                         //println!("{:#?}", ReplayFile::from_file(&file));
 
@@ -531,7 +564,7 @@ impl ToolkitTabViewer<'_> {
                 }
 
                 if let Some(_replays_dir) = self.tab_state.replays_dir.as_ref() {
-                    if ui.button("Load Live Game").clicked() {
+                    if ui.button(format!("{} Load Live Game", icons::DETECTIVE)).clicked() {
                         self.parse_live_replay();
                     }
                 }

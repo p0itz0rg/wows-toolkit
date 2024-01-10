@@ -4,6 +4,8 @@
 // When compiling natively:
 #[cfg(not(target_arch = "wasm32"))]
 fn main() -> eframe::Result<()> {
+    use std::{env, path::Path};
+
     env_logger::init(); // Log to stderr (if you run with `RUST_LOG=debug`).
 
     let icon_data: &[u8] = &include_bytes!("../assets/wows_toolkit.png")[..];
@@ -12,9 +14,26 @@ fn main() -> eframe::Result<()> {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([600.0, 400.0])
             .with_min_inner_size([400.0, 300.0])
-            .with_icon(eframe::icon_data::from_png_bytes(icon_data).expect("failed to load application icon")),
+            .with_icon(eframe::icon_data::from_png_bytes(icon_data).expect("failed to load application icon"))
+            .with_title(format!("{} v{}", wows_toolkit::APP_NAME, env!("CARGO_PKG_VERSION"))),
         ..Default::default()
     };
+
+    // Check to see if we need to delete the previous application
+    let args: Vec<String> = env::args().collect();
+    if args.len() == 2 {
+        let current_path = Path::new(args[0].as_str());
+        let old_path = Path::new(args[1].as_str());
+        // Sanity check -- ensure that these files are in the same directory
+        if current_path.parent() == old_path.parent() {
+            if let Some(name) = old_path.file_name().and_then(|name| name.to_str()) {
+                if name.contains(".exe") && old_path.exists() {
+                    let _ = std::fs::remove_file(old_path);
+                }
+            }
+        }
+    }
+
     eframe::run_native(wows_toolkit::APP_NAME, native_options, Box::new(|cc| Box::new(wows_toolkit::WowsToolkitApp::new(cc))))
 }
 

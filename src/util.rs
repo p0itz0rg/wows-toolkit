@@ -1,4 +1,4 @@
-use egui::Color32;
+use egui::{Color32, RichText};
 use flate2::{write::DeflateEncoder, Compression};
 use language_tags::LanguageTag;
 use log::debug;
@@ -149,6 +149,32 @@ pub fn build_short_ship_config_url(entity: &VehicleEntity, metadata_provider: &G
     let url = format!("https://app.wowssb.com/ship?shipIndexes={}&build={}&ref=landaire", ship.index(), parts.join(";"));
 
     url
+}
+
+pub fn colorize_captain_points(points: usize, skills: usize, highest_skill_tier: usize, num_tier_1_skills: usize) -> (RichText, Option<&'static str>) {
+    let mut color = match points {
+        0..=9 => Color32::LIGHT_RED,
+        10..=12 => Color32::from_rgb(0xfc, 0xae, 0x1e), // orange
+        13..=16 => Color32::YELLOW,
+        _ => Color32::LIGHT_GREEN,
+    };
+    const NUM_SKILLS_IN_TIER: usize = 6;
+
+    if num_tier_1_skills == NUM_SKILLS_IN_TIER {
+        color = Color32::LIGHT_RED;
+        (
+            RichText::new(format!("{} {}pts ({} skills)", crate::icons::CASTLE_TURRET, points, skills)).color(color),
+            Some("Player is playing tower defense with their skills"),
+        )
+    } else if highest_skill_tier <= 2 && points >= 6 {
+        color = Color32::LIGHT_RED;
+        (
+            RichText::new(format!("{} {}pts ({} skills)", crate::icons::WARNING, points, skills)).color(color),
+            Some("Player has no skills above tier 2"),
+        )
+    } else {
+        (RichText::new(format!("{}pts ({} skills)", points, skills)).color(color), None)
+    }
 }
 
 pub fn open_file_explorer(path: &Path) {

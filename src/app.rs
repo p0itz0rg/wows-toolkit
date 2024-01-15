@@ -20,6 +20,7 @@ use egui_dock::{DockArea, DockState, Style, TabViewer};
 use egui_extras::{Size, StripBuilder};
 use gettext::Catalog;
 
+use log::debug;
 use notify::{
     event::{ModifyKind, RenameMode},
     EventKind, RecommendedWatcher, RecursiveMode, Watcher,
@@ -39,7 +40,8 @@ use crate::{
     icons,
     plaintext_viewer::PlaintextFileViewer,
     replay_parser::{Replay, SharedReplayParserTabState},
-    task::{self, BackgroundTask, BackgroundTaskCompletion, BackgroundTaskKind, ShipIcon},
+    task::{self, BackgroundTask, BackgroundTaskCompletion, BackgroundTaskKind},
+    wows_data::WorldOfWarshipsData,
 };
 
 #[derive(Clone)]
@@ -125,30 +127,6 @@ impl TabViewer for ToolkitTabViewer<'_> {
     }
 }
 
-pub struct WorldOfWarshipsData {
-    pub file_tree: Option<FileNode>,
-
-    pub filtered_files: Option<Vec<(wowsunpack::Rc<PathBuf>, FileNode)>>,
-
-    pub pkg_loader: Option<Arc<PkgFileLoader>>,
-
-    pub game_metadata: Option<Arc<GameMetadataProvider>>,
-
-    pub current_replay: Option<Arc<RwLock<Replay>>>,
-
-    pub ship_icons: Option<HashMap<Species, ShipIcon>>,
-
-    pub game_version: Option<usize>,
-}
-
-impl WorldOfWarshipsData {
-    /// Indicates whether or not enough game data has been loaded to interact
-    /// with the PKG filesystem or replays
-    pub fn is_ready(&self) -> bool {
-        self.file_tree.is_some() && self.pkg_loader.is_some()
-    }
-}
-
 #[derive(Serialize, Deserialize)]
 pub struct ReplaySettings {
     pub show_game_chat: bool,
@@ -214,7 +192,7 @@ impl TimedMessage {
 #[serde(default)]
 pub struct TabState {
     #[serde(skip)]
-    pub world_of_warships_data: WorldOfWarshipsData,
+    pub world_of_warships_data: Option<Arc<WorldOfWarshipsData>>,
 
     pub filter: String,
 
@@ -244,9 +222,6 @@ pub struct TabState {
     pub file_watcher: Option<RecommendedWatcher>,
 
     #[serde(skip)]
-    pub replays_dir: Option<PathBuf>,
-
-    #[serde(skip)]
     pub file_receiver: Option<mpsc::Receiver<NotifyFileEvent>>,
 
     #[serde(skip)]
@@ -260,20 +235,15 @@ pub struct TabState {
 
     #[serde(skip)]
     pub can_change_wows_dir: bool,
+
+    #[serde(skip)]
+    pub current_replay: Option<Arc<RwLock<Replay>>>,
 }
 
 impl Default for TabState {
     fn default() -> Self {
         Self {
-            world_of_warships_data: WorldOfWarshipsData {
-                file_tree: None,
-                filtered_files: None,
-                pkg_loader: None,
-                game_metadata: None,
-                current_replay: Default::default(),
-                ship_icons: None,
-                game_version: None,
-            },
+            world_of_warships_data: None,
             filter: Default::default(),
             items_to_extract: Default::default(),
             settings: Default::default(),
@@ -284,12 +254,12 @@ impl Default for TabState {
             replay_parser_tab: Default::default(),
             file_viewer: Default::default(),
             file_watcher: None,
-            replays_dir: None,
             replay_files: None,
             file_receiver: None,
             background_task: None,
             can_change_wows_dir: true,
             timed_message: None,
+            current_replay: None,
         }
     }
 }
@@ -301,11 +271,15 @@ impl TabState {
                 while let Ok(file_event) = file.try_recv() {
                     match file_event {
                         NotifyFileEvent::Added(new_file) => {
-                            let replay_file: ReplayFile = ReplayFile::from_file(&new_file).unwrap();
-                            let game_metadata = self.world_of_warships_data.game_metadata.clone().unwrap();
-                            let replay = Replay::new(replay_file, game_metadata);
-                            let replay = Arc::new(RwLock::new(replay));
-                            replay_files.insert(new_file, replay);
+                            if let Some(wows_data) = self.world_of_warships_data.as_ref() {
+                                if let Some(game_metadata) = wows_data.game_metadata.as_ref() {
+                                    let replay_file: ReplayFile = ReplayFile::from_file(&new_file).unwrap();
+                                    let replay = Replay::new(replay_file, game_metadata.clone());
+                                    let replay = Arc::new(RwLock::new(replay));
+
+                                    replay_files.insert(new_file, replay);
+                                }
+                            }
                         }
                         NotifyFileEvent::Removed(old_file) => {
                             replay_files.remove(&old_file);
@@ -324,20 +298,18 @@ impl TabState {
         self.can_change_wows_dir = true;
     }
 
-    fn update_wows_dir(&mut self, wows_dir: &Path) {
-        let replay_dir = wows_dir.join("replays");
-
+    fn update_wows_dir(&mut self, wows_dir: &Path, replay_dir: &Path) {
         let watcher = if let Some(watcher) = self.file_watcher.as_mut() {
             let old_replays_dir = Path::new(self.settings.wows_dir.as_str()).join("replays");
             let _ = watcher.unwatch(&old_replays_dir);
             watcher
         } else {
-            eprintln!("creating filesystem watcher");
+            debug!("creating filesystem watcher");
             let (tx, rx) = mpsc::channel();
             let watcher = notify::recommended_watcher(move |res: Result<notify::Event, notify::Error>| match res {
                 Ok(event) => {
                     // TODO: maybe properly handle moves?
-                    println!("{:?}", event);
+                    debug!("filesytem event: {:?}", event);
                     match event.kind {
                         EventKind::Modify(ModifyKind::Name(RenameMode::To)) | EventKind::Create(_) => {
                             for path in event.paths {
@@ -356,7 +328,7 @@ impl TabState {
                         }
                     }
                 }
-                Err(e) => println!("watch error: {:?}", e),
+                Err(e) => debug!("watch error: {:?}", e),
             })
             .expect("failed to create fs watcher for replays dir");
 
@@ -367,9 +339,8 @@ impl TabState {
 
         // Add a path to be watched. All files and directories at that path and
         // below will be monitored for changes.
-        watcher.watch(replay_dir.as_ref(), RecursiveMode::NonRecursive).expect("failed to watch directory");
+        watcher.watch(replay_dir, RecursiveMode::NonRecursive).expect("failed to watch directory");
 
-        self.replays_dir = Some(replay_dir);
         self.settings.wows_dir = wows_dir.to_str().unwrap().to_string();
     }
 
@@ -489,8 +460,8 @@ impl WowsToolkitApp {
                     match result {
                         Ok(data) => match data {
                             BackgroundTaskCompletion::DataLoaded { new_dir, wows_data, replays } => {
-                                self.tab_state.update_wows_dir(&new_dir);
-                                self.tab_state.world_of_warships_data = wows_data;
+                                self.tab_state.update_wows_dir(&new_dir, &wows_data.replays_dir);
+                                self.tab_state.world_of_warships_data = Some(Arc::new(wows_data));
                                 self.tab_state.replay_files = replays;
 
                                 self.tab_state.timed_message = Some(TimedMessage::new(format!("{} Successfully loaded game data", icons::CHECK_CIRCLE)))
@@ -499,7 +470,7 @@ impl WowsToolkitApp {
                                 {
                                     self.tab_state.replay_parser_tab.lock().game_chat.clear();
                                 }
-                                self.tab_state.world_of_warships_data.current_replay = Some(replay);
+                                self.tab_state.current_replay = Some(replay);
                                 self.tab_state.timed_message = Some(TimedMessage::new(format!("{} Successfully loaded replay", icons::CHECK_CIRCLE)))
                             }
                             BackgroundTaskCompletion::UpdateDownloaded(new_exe) => {
@@ -749,4 +720,14 @@ fn build_error_window(ui: &mut egui::Ui, error: &dyn Error) {
         ui.label(format!("{} An error occurred:", icons::WARNING));
         ui.label(error.to_string());
     });
+}
+
+#[macro_export]
+macro_rules! update_background_task {
+    ($saved_task:expr, $background_task:expr) => {
+        let task = $background_task;
+        if task.is_some() {
+            $saved_task = $background_task;
+        }
+    };
 }

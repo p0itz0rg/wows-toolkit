@@ -1,10 +1,10 @@
 use std::{
     borrow::Cow,
-    path::{Path, PathBuf},
-    sync::{atomic::AtomicBool, mpsc, Arc},
+    path::{PathBuf},
+    sync::{atomic::AtomicBool, Arc},
 };
 
-use crate::{icons, update_background_task, wows_data::ShipIcon};
+use crate::{icons, update_background_task, util::build_tomato_gg_url, wows_data::ShipIcon};
 use egui::{
     mutex::{Mutex, RwLock},
     text::LayoutJob,
@@ -12,8 +12,8 @@ use egui::{
 };
 use egui_extras::{Column, TableBuilder};
 
-use log::debug;
 use tap::Pipe;
+use tracing::{debug};
 
 use wows_replays::{
     analyzer::{
@@ -32,7 +32,6 @@ use crate::{
     error::ToolkitError,
     game_params::GameMetadataProvider,
     plaintext_viewer::{self, FileType},
-    task::{BackgroundTask, BackgroundTaskCompletion, BackgroundTaskKind},
     util::{self, build_ship_config_url, build_short_ship_config_url, build_wows_numbers_url, player_color_for_team_relation, separate_number},
 };
 
@@ -302,6 +301,16 @@ impl ToolkitTabViewer<'_> {
                                     ui.close_menu();
                                 }
 
+                                ui.separator();
+
+                                if ui.small_button(format!("{} Open Tomato.gg Page", icons::SHARE)).clicked() {
+                                    if let Some(url) = build_tomato_gg_url(entity) {
+                                        ui.ctx().open_url(OpenUrl::new_tab(url));
+                                    }
+
+                                    ui.close_menu();
+                                }
+
                                 if ui.small_button(format!("{} Open WoWs Numbers Page", icons::SHARE)).clicked() {
                                     if let Some(url) = build_wows_numbers_url(entity) {
                                         ui.ctx().open_url(OpenUrl::new_tab(url));
@@ -459,21 +468,19 @@ impl ToolkitTabViewer<'_> {
                             [vehicle_name.as_str(), map_name.as_str(), scenario.as_str(), mode.as_str(), time].iter().join(" - ")
                         };
 
-                        if ui
-                            .add(Label::new(label.as_str()).sense(Sense::click()))
-                            .on_hover_text(label.as_str())
-                            .context_menu(|ui| {
-                                if ui.button("Copy Path").clicked() {
-                                    ui.output_mut(|output| output.copied_text = path.to_string_lossy().into_owned());
-                                    ui.close_menu();
-                                }
-                                if ui.button("Show in File Explorer").clicked() {
-                                    util::open_file_explorer(&path);
-                                    ui.close_menu();
-                                }
-                            })
-                            .double_clicked()
-                        {
+                        let label = ui.add(Label::new(label.as_str()).sense(Sense::click())).on_hover_text(label.as_str());
+                        label.context_menu(|ui| {
+                            if ui.button("Copy Path").clicked() {
+                                ui.output_mut(|output| output.copied_text = path.to_string_lossy().into_owned());
+                                ui.close_menu();
+                            }
+                            if ui.button("Show in File Explorer").clicked() {
+                                util::open_file_explorer(&path);
+                                ui.close_menu();
+                            }
+                        });
+
+                        if label.double_clicked() {
                             if let Some(wows_data) = self.tab_state.world_of_warships_data.as_ref() {
                                 update_background_task!(self.tab_state.background_task, wows_data.load_replay(replay.clone()));
                             }
@@ -485,7 +492,7 @@ impl ToolkitTabViewer<'_> {
         });
     }
 
-    pub fn clear_chat(&mut self, replay: Arc<RwLock<Replay>>) {
+    pub fn clear_chat(&mut self, _replay: Arc<RwLock<Replay>>) {
         self.tab_state.replay_parser_tab.lock().game_chat.clear();
     }
 

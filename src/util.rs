@@ -1,10 +1,10 @@
 use egui::{Color32, RichText};
 use flate2::{write::DeflateEncoder, Compression};
 use language_tags::LanguageTag;
-use log::debug;
 use serde_json::json;
 use std::{io::Write, path::Path, process::Command};
 use thousands::Separable;
+use tracing::debug;
 use wows_replays::{analyzer::battle_controller::VehicleEntity, game_params::GameParamProvider};
 
 use crate::game_params::GameMetadataProvider;
@@ -36,6 +36,11 @@ pub fn player_color_for_team_relation(relation: u32, is_dark_mode: bool) -> Colo
             }
         }
     }
+}
+
+pub fn build_tomato_gg_url(entity: &VehicleEntity) -> Option<String> {
+    let player = entity.player()?;
+    Some(format!("https://tomato.gg/wows/stats/{}/{}={}", player.realm(), player.name(), player.db_id()))
 }
 
 pub fn build_wows_numbers_url(entity: &VehicleEntity) -> Option<String> {

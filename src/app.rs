@@ -20,23 +20,22 @@ use egui_dock::{DockArea, DockState, Style, TabViewer};
 use egui_extras::{Size, StripBuilder};
 use gettext::Catalog;
 
-use log::debug;
 use notify::{
     event::{ModifyKind, RenameMode},
     EventKind, RecommendedWatcher, RecursiveMode, Watcher,
 };
 use octocrab::models::repos::Release;
+use tracing::debug;
 
 use serde::{Deserialize, Serialize};
-use sys_locale::get_locale;
+
 use tokio::runtime::Runtime;
-use wows_replays::{analyzer::battle_controller::GameMessage, game_params::Species, ReplayFile};
-use wowsunpack::{idx::FileNode, pkg::PkgFileLoader};
+use wows_replays::{analyzer::battle_controller::GameMessage, ReplayFile};
+use wowsunpack::{idx::FileNode};
 
 use crate::{
     error::ToolkitError,
     file_unpacker::{UnpackerProgress, UNPACKER_STOP},
-    game_params::GameMetadataProvider,
     icons,
     plaintext_viewer::PlaintextFileViewer,
     replay_parser::{Replay, SharedReplayParserTabState},
@@ -52,7 +51,7 @@ pub enum Tab {
 }
 
 impl Tab {
-    fn tab_name(&self) -> String {
+    fn title(&self) -> String {
         match self {
             Tab::Unpacker => format!("{} Resource Unpacker", icons::ARCHIVE),
             Tab::Settings => format!("{} Settings", icons::GEAR_FINE),
@@ -114,7 +113,7 @@ impl TabViewer for ToolkitTabViewer<'_> {
 
     // Returns the current `tab`'s title.
     fn title(&mut self, tab: &mut Self::Tab) -> WidgetText {
-        tab.tab_name().into()
+        tab.title().into()
     }
 
     // Defines the contents of a given `tab`.
@@ -152,6 +151,8 @@ pub const fn default_bool<const V: bool>() -> bool {
 pub struct Settings {
     pub current_replay_path: PathBuf,
     pub wows_dir: String,
+    #[serde(skip)]
+    pub replays_dir: Option<PathBuf>,
     pub locale: Option<String>,
     #[serde(default)]
     pub replay_settings: ReplaySettings,
@@ -195,6 +196,11 @@ pub struct TabState {
     pub world_of_warships_data: Option<Arc<WorldOfWarshipsData>>,
 
     pub filter: String,
+
+    #[serde(skip)]
+    pub used_filter: Option<String>,
+    #[serde(skip)]
+    pub filtered_file_list: Option<Arc<Vec<(Arc<PathBuf>, FileNode)>>>,
 
     #[serde(skip)]
     pub items_to_extract: Mutex<Vec<FileNode>>,
@@ -260,6 +266,8 @@ impl Default for TabState {
             can_change_wows_dir: true,
             timed_message: None,
             current_replay: None,
+            used_filter: None,
+            filtered_file_list: None,
         }
     }
 }
@@ -300,8 +308,8 @@ impl TabState {
 
     fn update_wows_dir(&mut self, wows_dir: &Path, replay_dir: &Path) {
         let watcher = if let Some(watcher) = self.file_watcher.as_mut() {
-            let old_replays_dir = Path::new(self.settings.wows_dir.as_str()).join("replays");
-            let _ = watcher.unwatch(&old_replays_dir);
+            let old_replays_dir = self.settings.replays_dir.as_ref().expect("watcher was created but replay dir was not assigned?");
+            let _ = watcher.unwatch(old_replays_dir);
             watcher
         } else {
             debug!("creating filesystem watcher");
@@ -342,6 +350,7 @@ impl TabState {
         watcher.watch(replay_dir, RecursiveMode::NonRecursive).expect("failed to watch directory");
 
         self.settings.wows_dir = wows_dir.to_str().unwrap().to_string();
+        self.settings.replays_dir = Some(replay_dir.to_owned())
     }
 
     pub fn load_game_data(&mut self, wows_directory: PathBuf) {
@@ -463,6 +472,8 @@ impl WowsToolkitApp {
                                 self.tab_state.update_wows_dir(&new_dir, &wows_data.replays_dir);
                                 self.tab_state.world_of_warships_data = Some(Arc::new(wows_data));
                                 self.tab_state.replay_files = replays;
+                                self.tab_state.filtered_file_list = None;
+                                self.tab_state.used_filter = None;
 
                                 self.tab_state.timed_message = Some(TimedMessage::new(format!("{} Successfully loaded game data", icons::CHECK_CIRCLE)))
                             }
@@ -727,7 +738,7 @@ macro_rules! update_background_task {
     ($saved_task:expr, $background_task:expr) => {
         let task = $background_task;
         if task.is_some() {
-            $saved_task = $background_task;
+            $saved_task = task;
         }
     };
 }

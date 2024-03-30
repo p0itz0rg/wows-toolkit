@@ -5,6 +5,7 @@ use std::{
 };
 
 use egui::mutex::RwLock;
+
 use wows_replays::{game_params::Species, ReplayFile};
 use wowsunpack::{idx::FileNode, pkg::PkgFileLoader};
 
